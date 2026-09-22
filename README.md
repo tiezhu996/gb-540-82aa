@@ -78,6 +78,7 @@ All endpoints below except login and health checks require `Authorization: Beare
 | `POST` | `/proposals/:id/transition` | Move proposal through allowed states |
 | `GET` | `/conflicts` | List detected topology conflicts |
 | `POST` | `/conflicts/detect` | Run detection; requires an `Idempotency-Key` header |
+| `POST` | `/conflicts/batch-confirm` | Reviewer batch-confirm: atomically set multiple still-detected conflicts of one proposal to `confirmed`, with one audit entry per conflict; unknown ids, other proposals, or changed states reject the whole batch |
 | `POST` | `/conflicts/:id/transition` | Confirm, mark false positive, propose resolution, or close a conflict |
 | `POST` | `/conflicts/:id/apply-suggestion` | Create a new draft proposal from the reviewed suggestion and resolve the source conflict |
 | `GET` | `/audit` | Read immutable audit events |

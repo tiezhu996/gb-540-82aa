@@ -24,6 +24,17 @@ export interface ApplySuggestionInput {
   rationale?: string
 }
 
+export interface BatchConfirmInput {
+  proposal_id: number
+  conflict_ids: number[]
+}
+
+export interface BatchConfirmResult {
+  proposal_id: number
+  count: number
+  conflict_ids: number[]
+}
+
 function newIdempotencyKey() {
   return crypto.randomUUID()
 }
@@ -46,6 +57,10 @@ export const topologyConflictApi = {
   async transition(id: number, body: ConflictTransitionInput) {
     const response = await api.post<ApiEnvelope<TopologyConflictWire>>(`/conflicts/${id}/transition`, body)
     return { ...response, data: { ...response.data, data: normalizeTopologyConflict(response.data.data) } }
+  },
+  async batchConfirm(body: BatchConfirmInput) {
+    const response = await api.post<ApiEnvelope<BatchConfirmResult>>('/conflicts/batch-confirm', body)
+    return response
   },
   applySuggestion: (id: number, body: ApplySuggestionInput = {}) =>
     api.post<ApiEnvelope<BoundaryProposal>>(`/conflicts/${id}/apply-suggestion`, body),

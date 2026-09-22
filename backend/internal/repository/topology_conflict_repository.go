@@ -90,6 +90,33 @@ func (r *TopologyConflictRepository) Transition(id uint, from, to string, resolv
 	return nil
 }
 
+// FindExistingIDs returns the subset of ids that actually exist. Callers use
+// the difference to reject batches referencing unknown conflicts.
+func (r *TopologyConflictRepository) FindExistingIDs(ids []uint) ([]uint, error) {
+	if len(ids) == 0 {
+		return []uint{}, nil
+	}
+	var found []uint
+	if err := r.db.Model(&model.TopologyConflict{}).Where("id IN ?", ids).Pluck("id", &found).Error; err != nil {
+		return nil, fmt.Errorf("find existing conflict ids: %w", err)
+	}
+	return found, nil
+}
+
+// BatchConfirm moves every listed conflict from detected to confirmed in one
+// conditional UPDATE. It must run inside a transaction together with audit
+// writes; RowsAffected guarantees no row changes unless all targets still are
+// in the detected state.
+func (r *TopologyConflictRepository) BatchConfirm(ids []uint) (int64, error) {
+	result := r.db.Model(&model.TopologyConflict{}).
+		Where("id IN ? AND conflict_state = ?", ids, "detected").
+		Update("conflict_state", "confirmed")
+	if result.Error != nil {
+		return 0, fmt.Errorf("batch confirm conflicts: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
 // TopologyDetectionRunRepository owns idempotency records for conflict detection.
 type TopologyDetectionRunRepository struct{ db *gorm.DB }
 

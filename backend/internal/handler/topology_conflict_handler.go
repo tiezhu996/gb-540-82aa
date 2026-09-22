@@ -59,6 +59,21 @@ func (h *CadastralHandler) TransitionConflict(c *gin.Context) {
 	ok(c, http.StatusOK, item, nil)
 }
 
+// BatchConfirmConflicts confirms multiple still-detected conflicts of one
+// proposal atomically. Any invalid reference rejects the whole batch.
+func (h *CadastralHandler) BatchConfirmConflicts(c *gin.Context) {
+	var req dto.BatchConfirmConflictsRequest
+	if !bind(c, h.validate, &req) {
+		return
+	}
+	result, err := h.service.BatchConfirmConflicts(req, actor(c))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	ok(c, http.StatusOK, result, nil)
+}
+
 func (h *CadastralHandler) ApplyConflictSuggestion(c *gin.Context) {
 	id, valid := idParam(c)
 	if !valid {

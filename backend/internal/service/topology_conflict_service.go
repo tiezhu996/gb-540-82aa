@@ -183,6 +183,71 @@ func (s *CadastralService) TransitionConflict(id uint, req dto.ConflictTransitio
 	return item, nil
 }
 
+// BatchConfirmConflicts moves a set of detected conflicts of one proposal to
+// confirmed in a single transaction. Anything abnormal (unknown id, a conflict
+// belonging to another proposal, or a state that already moved on) rejects the
+// whole operation and leaves every conflict untouched. Original evidence
+// geometries and parcel boundaries are never read or written here.
+func (s *CadastralService) BatchConfirmConflicts(req dto.BatchConfirmConflictsRequest, actor Actor) (dto.BatchConfirmConflictsResult, error) {
+	if err := requireAnyRole(actor, constants.RoleReviewer, constants.RoleAdmin); err != nil {
+		return dto.BatchConfirmConflictsResult{}, err
+	}
+	ids := normalizeConflictIDs(req.ConflictIDs)
+	if len(ids) == 0 {
+		return dto.BatchConfirmConflictsResult{}, invalid("conflict_ids must contain at least one positive id", nil)
+	}
+	if _, err := s.store.Proposals.Get(req.ProposalID); errors.Is(err, repository.ErrNotFound) {
+		return dto.BatchConfirmConflictsResult{}, notFound("proposal")
+	} else if err != nil {
+		return dto.BatchConfirmConflictsResult{}, internal("load proposal failed", err)
+	}
+	existing, err := s.store.Conflicts.FindExistingIDs(ids)
+	if err != nil {
+		return dto.BatchConfirmConflictsResult{}, internal("load conflicts failed", err)
+	}
+	if missing := missingConflictIDs(ids, existing); len(missing) > 0 {
+		return dto.BatchConfirmConflictsResult{}, notFound(fmt.Sprintf("conflict %d", missing[0]))
+	}
+	items, err := s.store.Conflicts.ListByIDs(ids)
+	if err != nil {
+		return dto.BatchConfirmConflictsResult{}, internal("load conflicts failed", err)
+	}
+	for _, item := range items {
+		if item.ProposalID != req.ProposalID {
+			return dto.BatchConfirmConflictsResult{}, conflict(fmt.Sprintf("conflict %d does not belong to proposal %d", item.ID, req.ProposalID), nil)
+		}
+		if item.ConflictState != constants.ConflictDetected {
+			return dto.BatchConfirmConflictsResult{}, conflict(fmt.Sprintf("conflict %d is no longer in detected state (current state: %s)", item.ID, item.ConflictState), nil)
+		}
+	}
+	err = s.store.Transaction(func(tx *repository.Store) error {
+		affected, transitionErr := tx.Conflicts.BatchConfirm(ids)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		if affected != int64(len(ids)) {
+			return conflict(fmt.Sprintf("expected %d conflicts to be confirmed, %d changed", len(ids), affected), nil)
+		}
+		for _, item := range items {
+			before := item
+			after := item
+			after.ConflictState = constants.ConflictConfirmed
+			if auditErr := tx.Audits.Create(audit(actor, "conflict.state_changed", "TopologyConflict", item.ID, &req.ProposalID, snapshot(before), snapshot(after))); auditErr != nil {
+				return auditErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		var appErr *AppError
+		if errors.As(err, &appErr) {
+			return dto.BatchConfirmConflictsResult{}, err
+		}
+		return dto.BatchConfirmConflictsResult{}, internal("batch confirm conflicts failed", err)
+	}
+	return dto.BatchConfirmConflictsResult{ProposalID: req.ProposalID, Count: len(ids), ConflictIDs: ids}, nil
+}
+
 func (s *CadastralService) ApplyConflictSuggestion(id uint, req dto.ApplySuggestionRequest, actor Actor) (model.BoundaryProposal, error) {
 	if err := requireAnyRole(actor, constants.RoleReviewer, constants.RoleAdmin); err != nil {
 		return model.BoundaryProposal{}, err
@@ -296,6 +361,39 @@ func uniqueSortedIDs(ids []uint) []uint {
 		}
 	}
 	return output
+}
+
+// normalizeConflictIDs drops blank (zero) entries and collapses duplicates so a
+// careless client cannot inflate the batch or double-count one conflict.
+func normalizeConflictIDs(ids []uint) []uint {
+	seen := make(map[uint]struct{}, len(ids))
+	normalized := make([]uint, 0, len(ids))
+	for _, id := range ids {
+		if id == 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		normalized = append(normalized, id)
+	}
+	sort.Slice(normalized, func(i, j int) bool { return normalized[i] < normalized[j] })
+	return normalized
+}
+
+func missingConflictIDs(requested, existing []uint) []uint {
+	present := make(map[uint]struct{}, len(existing))
+	for _, id := range existing {
+		present[id] = struct{}{}
+	}
+	missing := []uint{}
+	for _, id := range requested {
+		if _, ok := present[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	return missing
 }
 
 func geoInvalid(err error) error {
