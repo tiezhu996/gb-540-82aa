@@ -20,6 +20,17 @@ export interface ConflictTransitionInput {
   to: string
 }
 
+export interface ConflictBatchConfirmInput {
+  proposal_id: number
+  conflict_ids: number[]
+}
+
+export interface BatchConfirmConflictsResult {
+  proposal_id: number
+  confirmed_count: number
+  conflict_ids: number[]
+}
+
 export interface ApplySuggestionInput {
   rationale?: string
 }
@@ -46,6 +57,9 @@ export const topologyConflictApi = {
   async transition(id: number, body: ConflictTransitionInput) {
     const response = await api.post<ApiEnvelope<TopologyConflictWire>>(`/conflicts/${id}/transition`, body)
     return { ...response, data: { ...response.data, data: normalizeTopologyConflict(response.data.data) } }
+  },
+  async batchConfirm(body: ConflictBatchConfirmInput) {
+    return api.post<ApiEnvelope<BatchConfirmConflictsResult>>('/conflicts/batch-confirm', body)
   },
   applySuggestion: (id: number, body: ApplySuggestionInput = {}) =>
     api.post<ApiEnvelope<BoundaryProposal>>(`/conflicts/${id}/apply-suggestion`, body),

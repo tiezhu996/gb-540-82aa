@@ -1,12 +1,13 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { topologyConflictApi, type ApplySuggestionInput, type ConflictDetectInput, type ConflictQuery, type ConflictTransitionInput } from '@/api/topology-conflict'
+import { topologyConflictApi, type ApplySuggestionInput, type BatchConfirmConflictsResult, type ConflictBatchConfirmInput, type ConflictDetectInput, type ConflictQuery, type ConflictTransitionInput } from '@/api/topology-conflict'
 import type { BoundaryProposal } from '@/types/boundary-proposal'
 import type { TopologyConflict } from '@/types/topology-conflict'
 
 export const useTopologyConflictStore = defineStore('topology-conflicts', () => {
   const items = ref<TopologyConflict[]>([])
   const loading = ref(false)
+  const batchConfirming = ref(false)
 
   async function fetch(params?: ConflictQuery) {
     loading.value = true
@@ -38,10 +39,20 @@ export const useTopologyConflictStore = defineStore('topology-conflicts', () => 
     return data.data
   }
 
+  async function batchConfirm(body: ConflictBatchConfirmInput): Promise<BatchConfirmConflictsResult> {
+    batchConfirming.value = true
+    try {
+      const { data } = await topologyConflictApi.batchConfirm(body)
+      return data.data
+    } finally {
+      batchConfirming.value = false
+    }
+  }
+
   function replace(item: TopologyConflict) {
     const index = items.value.findIndex((current) => current.id === item.id)
     if (index >= 0) items.value[index] = item
   }
 
-  return { items, loading, fetch, detect, transition, applySuggestion }
+  return { items, loading, batchConfirming, fetch, detect, transition, applySuggestion, batchConfirm }
 })

@@ -78,6 +78,7 @@ All endpoints below except login and health checks require `Authorization: Beare
 | `POST` | `/proposals/:id/transition` | Move proposal through allowed states |
 | `GET` | `/conflicts` | List detected topology conflicts |
 | `POST` | `/conflicts/detect` | Run detection; requires an `Idempotency-Key` header |
+| `POST` | `/conflicts/batch-confirm` | Reviewer confirms multiple detected conflicts of one proposal in one transaction |
 | `POST` | `/conflicts/:id/transition` | Confirm, mark false positive, propose resolution, or close a conflict |
 | `POST` | `/conflicts/:id/apply-suggestion` | Create a new draft proposal from the reviewed suggestion and resolve the source conflict |
 | `GET` | `/audit` | Read immutable audit events |
@@ -101,6 +102,8 @@ The frontend sends every request through `/api/v1`. `parcel_ids` is persisted by
 The independent Gin middleware files are `request_id.go`, `recovery.go`, `auth.go`, `rbac.go`, `audit.go`, and `error_handler.go`. They establish request correlation and audit context before authentication, enforce authorization and rate limits, recover panics, and retain a uniform JSON fallback for recorded Gin errors.
 
 Allowed proposal flow is `draft -> validated -> submitted -> reviewed -> accepted/rejected`, with `reviewed -> revision -> draft`. Illegal transitions return `409`; an author cannot review their own proposal. Conflict flow is `detected -> confirmed -> resolution_proposed -> resolved -> closed`, with the alternate `detected -> false_positive -> closed` path. Applying a reviewed suggestion creates a new draft proposal version and resolves the source conflict; it does not rewrite the original proposal or parcel boundary.
+
+`POST /conflicts/batch-confirm` lets a reviewer tick any number of still-`detected` conflicts under one proposal and confirm them once. The request body is `{"proposal_id": <uint>, "conflict_ids": [<uint>...]}`; blank/zero entries are dropped and duplicate numbers collapse, but the whole operation is rejected without touching any conflict when a number does not exist (`404`), belongs to another proposal (`400`), or has already changed state (`409`). On success every selected conflict moves `detected -> confirmed` inside a single transaction, each transition writes its own `conflict.batch_confirmed` audit entry, and the response returns the proposal id, the confirmed count, and the sorted unique conflict ids. The conflicts page enforces the same single-proposal selection in the UI and reads the confirmed states back after refresh. Original evidence geometry and parcel boundaries are never modified by review actions.
 
 ## Coordinates And Legal Boundary
 

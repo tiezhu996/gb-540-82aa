@@ -53,6 +53,30 @@ func (r *TopologyConflictRepository) ListByIDs(ids []uint) ([]model.TopologyConf
 	return ordered, nil
 }
 
+// ListExistingByIDs loads the conflicts that currently exist for the given
+// IDs. Missing rows are simply absent from the result so callers can report
+// them as rejected selections; the returned slice keeps the requested order.
+func (r *TopologyConflictRepository) ListExistingByIDs(ids []uint) ([]model.TopologyConflict, error) {
+	if len(ids) == 0 {
+		return []model.TopologyConflict{}, nil
+	}
+	var items []model.TopologyConflict
+	if err := r.db.Where("id IN ?", ids).Find(&items).Error; err != nil {
+		return nil, fmt.Errorf("find topology conflicts by ids: %w", err)
+	}
+	byID := make(map[uint]model.TopologyConflict, len(items))
+	for _, item := range items {
+		byID[item.ID] = item
+	}
+	ordered := make([]model.TopologyConflict, 0, len(items))
+	for _, id := range ids {
+		if item, ok := byID[id]; ok {
+			ordered = append(ordered, item)
+		}
+	}
+	return ordered, nil
+}
+
 func (r *TopologyConflictRepository) List(q dto.ConflictQuery) ([]model.TopologyConflict, int64, error) {
 	db := r.db.Model(&model.TopologyConflict{})
 	if q.ProposalID != nil {

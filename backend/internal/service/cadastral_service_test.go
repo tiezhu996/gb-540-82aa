@@ -194,3 +194,125 @@ func TestSupersedingObservationRecordsReplacement(t *testing.T) {
 		t.Fatalf("persisted observation = %#v, want incremented version and replacement", persisted)
 	}
 }
+
+func createTestConflicts(t *testing.T, svc *CadastralService, store *repository.Store, proposal model.BoundaryProposal, count int, state string) []model.TopologyConflict {
+	t.Helper()
+	items := make([]model.TopologyConflict, 0, count)
+	for index := 0; index < count; index++ {
+		item := model.TopologyConflict{
+			ProposalID: proposal.ID, ParcelIDs: "[]", ConflictType: constants.ConflictOverlap, MagnitudeSquareM: float64(index + 1),
+			Severity: "medium", AlgorithmVersion: "batch-test", InputHash: fmt.Sprintf("batch-hash-%d", index), ConflictState: state,
+			SuggestedResolutionJSON: "{}", Explanation: "batch review fixture", DetectedAt: time.Now().UTC(),
+		}
+		if err := store.Conflicts.Create(&item); err != nil {
+			t.Fatalf("create test conflict %d: %v", index, err)
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
+func TestBatchConfirmConflictsConfirmsAllAndAuditsEach(t *testing.T) {
+	svc, store := newCadastralTestService(t)
+	base := createTestParcel(t, svc, "P-BATCH-BASE", serviceTestPolygon(`[0,0],[10,0],[10,10],[0,10],[0,0]`), testActor(602, constants.RoleSurveyor, "batch-base-create"))
+	proposal := createTestProposal(t, svc, base, serviceTestPolygon(`[0,0],[11,0],[11,10],[0,10],[0,0]`), testActor(602, constants.RoleSurveyor, "batch-proposal-create"))
+	found := createTestConflicts(t, svc, store, proposal, 3, constants.ConflictDetected)
+	reviewer := testActor(610, constants.RoleReviewer, "batch-confirm-ok")
+	// IDs intentionally unsorted, duplicated and padded with zero entries.
+	requestIDs := []uint{found[2].ID, 0, found[0].ID, found[1].ID, found[2].ID, 0}
+	result, err := svc.BatchConfirmConflicts(dto.BatchConfirmConflictsRequest{ProposalID: proposal.ID, ConflictIDs: requestIDs}, reviewer)
+	if err != nil {
+		t.Fatalf("BatchConfirmConflicts() error = %v", err)
+	}
+	if result.ProposalID != proposal.ID || result.ConfirmedCount != 3 {
+		t.Fatalf("batch result = %#v, want proposal %d and 3 confirmations", result, proposal.ID)
+	}
+	if result.ConflictIDs[0] >= result.ConflictIDs[1] || result.ConflictIDs[1] >= result.ConflictIDs[2] {
+		t.Fatalf("returned conflict ids = %v, want sorted unique ids", result.ConflictIDs)
+	}
+	for _, item := range found {
+		reloaded, getErr := svc.GetConflict(item.ID)
+		if getErr != nil {
+			t.Fatalf("reload conflict %d: %v", item.ID, getErr)
+		}
+		if reloaded.ConflictState != constants.ConflictConfirmed {
+			t.Fatalf("conflict %d state = %s, want confirmed", item.ID, reloaded.ConflictState)
+		}
+	}
+	var auditCount int64
+	if err := store.DB.Model(&model.AuditLog{}).Where("action = ? AND request_id = ?", "conflict.batch_confirmed", reviewer.RequestID).Count(&auditCount).Error; err != nil {
+		t.Fatalf("count batch audits: %v", err)
+	}
+	if auditCount != int64(len(result.ConflictIDs)) {
+		t.Fatalf("batch audit count = %d, want one per confirmed conflict (%d)", auditCount, len(result.ConflictIDs))
+	}
+	var parcelUpdates int64
+	if err := store.DB.Model(&model.LandParcel{}).Where("boundary_version <> ?", 1).Count(&parcelUpdates).Error; err != nil {
+		t.Fatalf("count parcel versions: %v", err)
+	}
+	if parcelUpdates != 0 {
+		t.Fatalf("batch review changed %d parcel versions; evidence boundaries must stay untouched", parcelUpdates)
+	}
+}
+
+func TestBatchConfirmConflictsRejectsMissingCrossProposalAndChangedState(t *testing.T) {
+	svc, store := newCadastralTestService(t)
+	base := createTestParcel(t, svc, "P-BATCH-BASE", serviceTestPolygon(`[0,0],[10,0],[10,10],[0,10],[0,0]`), testActor(602, constants.RoleSurveyor, "batch-base-create-2"))
+	proposal := createTestProposal(t, svc, base, serviceTestPolygon(`[0,0],[11,0],[11,10],[0,10],[0,0]`), testActor(602, constants.RoleSurveyor, "batch-proposal-create-2"))
+	found := createTestConflicts(t, svc, store, proposal, 2, constants.ConflictDetected)
+	reviewer := testActor(620, constants.RoleReviewer, "batch-confirm-reject")
+
+	// A nonexistent conflict number rejects the whole batch without writes.
+	missingIDs := []uint{found[0].ID, uint(1_000_000)}
+	_, err := svc.BatchConfirmConflicts(dto.BatchConfirmConflictsRequest{ProposalID: proposal.ID, ConflictIDs: missingIDs}, reviewer)
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != CodeNotFound || appErr.Status != 404 {
+		t.Fatalf("missing id error = %v, want 404 %s", err, CodeNotFound)
+	}
+
+	// A conflict from another proposal cannot be mixed into the batch.
+	otherBase := createTestParcel(t, svc, "P-BATCH-OTHER", serviceTestPolygon(`[30,0],[40,0],[40,10],[30,10],[30,0]`), testActor(621, constants.RoleSurveyor, "batch-other-base"))
+	otherProposal := createTestProposal(t, svc, otherBase, serviceTestPolygon(`[30,0],[40,0],[40,10],[30,10],[30,0]`), testActor(621, constants.RoleSurveyor, "batch-other-proposal"))
+	otherConflict := createTestConflicts(t, svc, store, otherProposal, 1, constants.ConflictDetected)[0]
+	_, err = svc.BatchConfirmConflicts(dto.BatchConfirmConflictsRequest{ProposalID: proposal.ID, ConflictIDs: []uint{found[0].ID, otherConflict.ID}}, reviewer)
+	if !errors.As(err, &appErr) || appErr.Code != CodeInvalidInput || appErr.Status != 400 {
+		t.Fatalf("cross proposal error = %v, want 400 %s", err, CodeInvalidInput)
+	}
+
+	// A state change between selection and submission rejects the batch.
+	if _, err := svc.TransitionConflict(found[1].ID, dto.ConflictTransitionRequest{To: constants.ConflictFalsePositive}, reviewer); err != nil {
+		t.Fatalf("mark conflict false positive: %v", err)
+	}
+	_, err = svc.BatchConfirmConflicts(dto.BatchConfirmConflictsRequest{ProposalID: proposal.ID, ConflictIDs: []uint{found[0].ID, found[1].ID}}, reviewer)
+	if !errors.As(err, &appErr) || appErr.Code != CodeConflict || appErr.Status != 409 {
+		t.Fatalf("changed state error = %v, want 409 %s", err, CodeConflict)
+	}
+
+	// None of the rejected batches may have moved still-detected conflicts.
+	reloaded, err := svc.GetConflict(found[0].ID)
+	if err != nil {
+		t.Fatalf("reload untouched conflict: %v", err)
+	}
+	if reloaded.ConflictState != constants.ConflictDetected {
+		t.Fatalf("conflict %d state = %s after rejected batches, want detected unchanged", found[0].ID, reloaded.ConflictState)
+	}
+	var auditCount int64
+	if err := store.DB.Model(&model.AuditLog{}).Where("action = ?", "conflict.batch_confirmed").Count(&auditCount).Error; err != nil {
+		t.Fatalf("count batch audits after rejections: %v", err)
+	}
+	if auditCount != 0 {
+		t.Fatalf("rejected batches wrote %d batch audits, want none", auditCount)
+	}
+}
+
+func TestBatchConfirmConflictsRequiresReviewerRole(t *testing.T) {
+	svc, store := newCadastralTestService(t)
+	base := createTestParcel(t, svc, "P-BATCH-ROLE", serviceTestPolygon(`[0,0],[10,0],[10,10],[0,10],[0,0]`), testActor(631, constants.RoleSurveyor, "batch-role-parcel"))
+	proposal := createTestProposal(t, svc, base, serviceTestPolygon(`[0,0],[11,0],[11,10],[0,10],[0,0]`), testActor(631, constants.RoleSurveyor, "batch-role-proposal"))
+	found := createTestConflicts(t, svc, store, proposal, 1, constants.ConflictDetected)
+	_, err := svc.BatchConfirmConflicts(dto.BatchConfirmConflictsRequest{ProposalID: proposal.ID, ConflictIDs: []uint{found[0].ID}}, testActor(630, constants.RoleGISAnalyst, "batch-confirm-forbidden"))
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != CodeForbidden || appErr.Status != 403 {
+		t.Fatalf("analyst batch confirm error = %v, want 403 %s", err, CodeForbidden)
+	}
+}

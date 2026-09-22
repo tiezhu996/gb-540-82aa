@@ -183,6 +183,80 @@ func (s *CadastralService) TransitionConflict(id uint, req dto.ConflictTransitio
 	return item, nil
 }
 
+// BatchConfirmConflicts moves every selected conflict of one proposal from
+// detected to confirmed in a single transaction. Selection numbers are
+// normalized first (zero/empty entries dropped, duplicates collapsed). The
+// operation is rejected without touching any conflict when a number does not
+// exist, belongs to another proposal, or no longer is in detected state.
+func (s *CadastralService) BatchConfirmConflicts(req dto.BatchConfirmConflictsRequest, actor Actor) (dto.BatchConfirmConflictsResult, error) {
+	if err := requireAnyRole(actor, constants.RoleReviewer, constants.RoleAdmin); err != nil {
+		return dto.BatchConfirmConflictsResult{}, err
+	}
+	ids := make([]uint, 0, len(req.ConflictIDs))
+	seen := make(map[uint]bool, len(req.ConflictIDs))
+	for _, id := range req.ConflictIDs {
+		if id == 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return dto.BatchConfirmConflictsResult{}, invalid("select at least one detected conflict to confirm", nil)
+	}
+	items, err := s.store.Conflicts.ListExistingByIDs(ids)
+	if err != nil {
+		return dto.BatchConfirmConflictsResult{}, internal("load conflicts for batch review failed", err)
+	}
+	found := make(map[uint]bool, len(items))
+	for _, item := range items {
+		found[item.ID] = true
+	}
+	if missing := joinMissingIDs(ids, found); missing != "" {
+		return dto.BatchConfirmConflictsResult{}, notFound("conflict(s) " + missing)
+	}
+	for _, item := range items {
+		if item.ProposalID != req.ProposalID {
+			return dto.BatchConfirmConflictsResult{}, invalid(fmt.Sprintf("conflict %d belongs to proposal %d, not proposal %d; batch review is limited to one proposal", item.ID, item.ProposalID, req.ProposalID), nil)
+		}
+	}
+	for _, item := range items {
+		if item.ConflictState != constants.ConflictDetected {
+			return dto.BatchConfirmConflictsResult{}, conflict(fmt.Sprintf("conflict %d is %s and can only be confirmed while detected", item.ID, item.ConflictState), nil)
+		}
+		if !constants.CanConflictTransition(item.ConflictState, constants.ConflictConfirmed) {
+			return dto.BatchConfirmConflictsResult{}, conflict(fmt.Sprintf("conflict %d cannot transition from %s to confirmed", item.ID, item.ConflictState), nil)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	proposalID := req.ProposalID
+	err = s.store.Transaction(func(tx *repository.Store) error {
+		for _, item := range items {
+			if transitionErr := tx.Conflicts.Transition(item.ID, constants.ConflictDetected, constants.ConflictConfirmed, nil); transitionErr != nil {
+				return transitionErr
+			}
+			if auditErr := tx.Audits.Create(audit(actor, "conflict.batch_confirmed", "TopologyConflict", item.ID, &proposalID, snapshot(item), snapshot(map[string]any{"state": constants.ConflictConfirmed}))); auditErr != nil {
+				return auditErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return dto.BatchConfirmConflictsResult{}, conflict("a selected conflict changed while batch confirming; no conflict was modified", err)
+	}
+	return dto.BatchConfirmConflictsResult{ProposalID: req.ProposalID, ConfirmedCount: len(ids), ConflictIDs: ids}, nil
+}
+
+func joinMissingIDs(requested []uint, found map[uint]bool) string {
+	missing := make([]string, 0)
+	for _, id := range requested {
+		if !found[id] {
+			missing = append(missing, strconv.FormatUint(uint64(id), 10))
+		}
+	}
+	return strings.Join(missing, ", ")
+}
+
 func (s *CadastralService) ApplyConflictSuggestion(id uint, req dto.ApplySuggestionRequest, actor Actor) (model.BoundaryProposal, error) {
 	if err := requireAnyRole(actor, constants.RoleReviewer, constants.RoleAdmin); err != nil {
 		return model.BoundaryProposal{}, err
